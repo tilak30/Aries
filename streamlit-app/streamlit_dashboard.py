@@ -201,6 +201,29 @@ def fetch_top_topics(brand, hours=24, limit=10):
     finally:
         conn.close()
 
+@st.cache_data(ttl=30)
+def fetch_sentiment_by_source(brand, hours=24):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    source,
+                    sentiment_label,
+                    COUNT(*) as count
+                FROM processed.sentiment_analysis
+                WHERE analyzed_at >= NOW() - INTERVAL '%s hours' AND brand = %s
+                GROUP BY source, sentiment_label
+                ORDER BY source, sentiment_label;
+            """, (hours, brand))
+            return pd.DataFrame(cur.fetchall())
+    except Exception as e:
+        st.warning(f"⚠️ Sentiment by source query failed: {e}")
+        return pd.DataFrame()
+    finally:
+        if conn:
+            conn.close()
 
 @st.cache_data(ttl=30)
 def fetch_anomalies(brand, hours=24, limit=5):
@@ -215,10 +238,10 @@ def fetch_anomalies(brand, hours=24, limit=5):
                     severity,
                     description
                 FROM analytics.anomalies
-                WHERE detected_at >= NOW() - INTERVAL '%s hours' AND affected_topic LIKE %s
+                WHERE detected_at >= NOW() - INTERVAL '%s hours' AND description ILIKE %s
                 ORDER BY detected_at DESC
                 LIMIT %s;
-            """, (hours, f"%{brand}%", limit))
+            """, (hours, f"%{brand}%", limit)) # Use ILIKE for case-insensitive matching
             return pd.DataFrame(cur.fetchall())
     except Exception as e:
         st.warning(f"⚠️ Anomalies query failed: {e}")
@@ -233,11 +256,21 @@ def fetch_negative_mentions(brand, hours=24, limit=10):
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # This query uses a window function to find the most recent analysis for each post_id,
+            # ensuring that we only get unique posts, even if they were processed multiple times.
             cur.execute("""
+                WITH ranked_mentions AS (
+                    SELECT 
+                        post_id, content, sentiment_score, source, analyzed_at, brand,
+                        ROW_NUMBER() OVER(PARTITION BY post_id ORDER BY analyzed_at DESC) as rn
+                    FROM processed.sentiment_analysis
+                    WHERE sentiment_label = 'NEGATIVE'
+                        AND analyzed_at >= NOW() - INTERVAL '%s hours'
+                        AND brand = %s
+                )
                 SELECT post_id, content, sentiment_score, source, analyzed_at as created_at
-                FROM processed.sentiment_analysis
-                WHERE sentiment_label = 'NEGATIVE'
-                    AND analyzed_at >= NOW() - INTERVAL '%s hours' AND brand = %s
+                FROM ranked_mentions
+                WHERE rn = 1
                 ORDER BY sentiment_score ASC, analyzed_at DESC
                 LIMIT %s;
             """, (hours, brand, limit))
@@ -342,7 +375,28 @@ def generate_demo_data():
         'created_at': pd.date_range(end=datetime.now(), periods=15, freq='1H')
     })
     
-    return sentiment_data, timeseries_df, topics_data, anomalies_data, negative_mentions
+    # Generate sentiment by source
+    source_data = pd.DataFrame([
+        {'source': 'reddit', 'sentiment_label': 'POSITIVE', 'count': 150},
+        {'source': 'reddit', 'sentiment_label': 'NEUTRAL', 'count': 80},
+        {'source': 'reddit', 'sentiment_label': 'NEGATIVE', 'count': 30},
+        {'source': 'google_news', 'sentiment_label': 'POSITIVE', 'count': 174},
+        {'source': 'google_news', 'sentiment_label': 'NEUTRAL', 'count': 76},
+        {'source': 'google_news', 'sentiment_label': 'NEGATIVE', 'count': 15},
+    ])
+    
+    return sentiment_data, timeseries_df, topics_data, anomalies_data, negative_mentions, source_data
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def get_sentiment_color(score):
+    """Returns a color based on sentiment score."""
+    if score > 0.6: return 'var(--positive-color)'
+    if score < 0.4: return 'var(--danger-color)'
+    return '#7f7f7f'
 
 
 # ============================================================================
@@ -405,12 +459,13 @@ def main():
     
     if use_demo:
         st.info("📊 Running with **Demo Data**. Toggle off in the sidebar to connect to the live database.")
-        sentiment_overview, timeseries_df, topics_df, anomalies_df, negative_mentions_df = generate_demo_data()
+        sentiment_overview, timeseries_df, topics_df, anomalies_df, negative_mentions_df, source_df = generate_demo_data()
     else:
         sentiment_overview = fetch_sentiment_overview(selected_brand, time_range_hours)
         timeseries_df = fetch_sentiment_timeseries(selected_brand, time_range_hours)
         topics_df = fetch_top_topics(selected_brand, time_range_hours)
         anomalies_df = fetch_anomalies(selected_brand, time_range_hours)
+        source_df = fetch_sentiment_by_source(selected_brand, time_range_hours)
         negative_mentions_df = fetch_negative_mentions(selected_brand, time_range_hours)
     
     st.header(f"Dashboard for: **{selected_brand}**")
@@ -465,11 +520,13 @@ def main():
     # SECTION 2: SENTIMENT DISTRIBUTION & TRENDS
     # ============================================================================
     
-    col1, col2 = st.columns(2)
+    st.subheader("📊 Sentiment Analysis Deep Dive")
+    tab1, tab2, tab3 = st.tabs(["📈 Trend Analysis", "📊 Breakdown by Source", "🌐 Overall Distribution"])
     
     # Sentiment Distribution (Pie Chart)
-    with col1:
-        st.subheader(f"📊 Sentiment Distribution")
+    with tab3:
+        st.markdown("#### Overall Sentiment Distribution")
+        st.markdown("A high-level overview of positive, neutral, and negative mentions.")
         if not sentiment_overview.empty:
             fig_pie = go.Figure(data=[go.Pie(
                 labels=sentiment_overview['sentiment_label'],
@@ -494,53 +551,103 @@ def main():
             st.info("No sentiment distribution data to display.")
     
     # Sentiment Trend Over Time (Line Chart)
-    with col2:
-        st.subheader(f"📈 Sentiment Trend")
+    with tab1:
+        st.markdown("#### Average Sentiment Score & Volume Over Time")
+        st.markdown("Track the brand's health (average sentiment) and the volume of conversation (mention count) over time.")
         if not timeseries_df.empty:
-            pivot_df = timeseries_df.pivot_table(
-                index='hour',
-                columns='sentiment_label',
-                values='count',
-                aggfunc='sum',
-                fill_value=0
-            )
+            # Aggregate data by hour for both score and volume
+            trend_agg = timeseries_df.groupby('hour').agg(
+                total_mentions=('count', 'sum'),
+                avg_sentiment=('avg_score', 'mean')
+            ).reset_index()
             
             fig_line = go.Figure()
             
-            colors_map = {'POSITIVE': '#2ca02c', 'NEUTRAL': '#7f7f7f', 'NEGATIVE': '#d62728'}
-            for column in pivot_df.columns:
-                fig_line.add_trace(go.Scatter(
-                    x=pivot_df.index,
-                    y=pivot_df[column],
-                    mode='lines+markers',
-                    name=column,
-                    line=dict(color=colors_map.get(column, '#1f77b4'), width=3),
-                    fill='tozeroy' if column == list(pivot_df.columns)[0] else None,
-                    hovertemplate='<b>%{fullData.name}</b><br>Time: %{x}<br>Count: %{y}<extra></extra>'
-                ))
+            # Add volume as a bar chart
+            fig_line.add_trace(go.Bar(
+                x=trend_agg['hour'],
+                y=trend_agg['total_mentions'],
+                name='Mention Volume',
+                marker_color='rgba(31, 119, 180, 0.4)',
+                yaxis='y2'
+            ))
+            
+            # Add average sentiment as a line chart
+            fig_line.add_trace(go.Scatter(
+                x=trend_agg['hour'],
+                y=trend_agg['avg_sentiment'],
+                mode='lines+markers',
+                name='Average Sentiment',
+                line=dict(color='var(--secondary-color)', width=3),
+                yaxis='y1'
+            ))
             
             fig_line.update_layout(
                 template='plotly_dark',
                 title_x=0.5,
                 paper_bgcolor='rgba(26, 31, 54, 0)',
                 plot_bgcolor='rgba(26, 31, 54, 0)',
-                font=dict(color='white', size=12),
+                font=dict(color='white'),
                 hovermode='x unified',
                 height=400,
-                xaxis_title='Time',
-                yaxis_title='Count'
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                yaxis=dict(
+                    title='Average Sentiment Score (0-1)',
+                    range=[0, 1]
+                ),
+                yaxis2=dict(
+                    title='Mention Volume',
+                    overlaying='y',
+                    side='right',
+                    showgrid=False
+                )
             )
             st.plotly_chart(fig_line, use_container_width=True)
         else:
             st.info("No time-series data to display.")
     
+    # Sentiment by Source
+    with tab2:
+        st.markdown("#### Sentiment Breakdown by Data Source")
+        st.markdown("Compare sentiment across different channels like Reddit and news articles.")
+        if not source_df.empty:
+            pivot_source = source_df.pivot_table(index='source', columns='sentiment_label', values='count', aggfunc='sum').fillna(0)
+            
+            fig_source = go.Figure()
+            colors_map = {'POSITIVE': '#2ca02c', 'NEUTRAL': '#7f7f7f', 'NEGATIVE': '#d62728'}
+            
+            for sentiment in ['POSITIVE', 'NEUTRAL', 'NEGATIVE']:
+                if sentiment in pivot_source.columns:
+                    fig_source.add_trace(go.Bar(
+                        y=pivot_source.index,
+                        x=pivot_source[sentiment],
+                        name=sentiment,
+                        orientation='h',
+                        marker_color=colors_map[sentiment]
+                    ))
+            
+            fig_source.update_layout(
+                barmode='stack',
+                template='plotly_dark',
+                paper_bgcolor='rgba(26, 31, 54, 0)',
+                plot_bgcolor='rgba(26, 31, 54, 0)',
+                font=dict(color='white'),
+                height=400,
+                xaxis_title='Number of Mentions',
+                yaxis_title='Source',
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_source, use_container_width=True)
+        else:
+            st.info("No source data to display.")
+
     st.markdown("---")
     
     # ============================================================================
     # SECTION 3: TRENDING TOPICS & ANOMALIES
     # ============================================================================
     
-    col1, col2 = st.columns([1.2, 0.8])
+    col1, col2 = st.columns([1.5, 1])
     
     # Top Topics
     with col1:
@@ -548,33 +655,33 @@ def main():
         if not topics_df.empty:
             topics_df_sorted = topics_df.sort_values('mentions', ascending=True)
             
-            fig_topics = go.Figure(data=[
-                go.Bar(
-                    y=topics_df_sorted['topic'],
-                    x=topics_df_sorted['mentions'],
-                    orientation='h',
-                    marker=dict(
-                        color=topics_df_sorted['avg_sentiment'],
-                        colorscale='RdYlGn',
-                        showscale=True,
-                        colorbar=dict(title="Avg Sentiment", thickness=15)
-                    ),
-                    text=topics_df_sorted['mentions'],
-                    textposition='outside',
-                    hovertemplate='<b>%{y}</b><br>Mentions: %{x}<br>Avg Sentiment: %{marker.color:.2f}<extra></extra>'
-                )
-            ])
+            # Topic Quadrant (Bubble) Chart
+            fig_bubble = go.Figure(data=[go.Scatter(
+                x=topics_df['mentions'],
+                y=topics_df['avg_sentiment'],
+                mode='markers+text',
+                text=topics_df['topic'],
+                textposition='top center',
+                marker=dict(
+                    size=topics_df['mentions'].apply(lambda x: np.sqrt(x) * 3), # Scale size
+                    color=topics_df['avg_sentiment'],
+                    colorscale='RdYlGn',
+                    showscale=True,
+                    colorbar=dict(title="Avg Sentiment")
+                ),
+                hovertemplate='<b>Topic: %{text}</b><br>Mentions: %{x}<br>Avg Sentiment: %{y:.2f}<extra></extra>'
+            )])
             
-            fig_topics.update_layout(
+            fig_bubble.update_layout(
                 template='plotly_dark',
                 paper_bgcolor='rgba(26, 31, 54, 0)',
                 plot_bgcolor='rgba(26, 31, 54, 0)',
-                font=dict(color='white', size=11),
+                font=dict(color='white'),
+                xaxis_title='Mention Volume (Conversation Size)',
+                yaxis_title='Average Sentiment Score (0-1)',
                 height=400,
-                xaxis_title='Mention Count',
-                margin=dict(l=150)
             )
-            st.plotly_chart(fig_topics, use_container_width=True)
+            st.plotly_chart(fig_bubble, use_container_width=True)
         else:
             st.info("No topic data to display.")
     

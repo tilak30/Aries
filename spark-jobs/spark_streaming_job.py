@@ -264,6 +264,7 @@ def write_to_postgres_batch(df, epoch_id):
             topic_df.select(
                 col("post_id"),
                 col("topic"),
+                col("brand"),
                 col("sentiment_score"),
                 col("confidence"),
                 col("analyzed_at"),                      # ✅ Analysis time
